@@ -317,29 +317,6 @@ int prepareClientToWrite(client *c) {
  * Low level functions to add more data to output buffers.
  * -------------------------------------------------------------------------- */
 
-/* Attempts to add the reply to the static buffer in the client struct.
- * Returns the length of data that is added to the reply buffer.
- *
- * Sanitizer suppression: client->buf_usable_size determined by
- * zmalloc_usable_size() call. Writing beyond client->buf boundaries confuses
- * sanitizer and generates a false positive out-of-bounds error */
-REDIS_NO_SANITIZE("bounds")
-size_t _addReplyToBuffer(client *c, const char *s, size_t len) {
-    size_t available = c->buf_usable_size - c->bufpos;
-
-    /* If there already are entries in the reply list, we cannot
-     * add anything more to the static buffer. */
-    if (listLength(c->reply) > 0) return 0;
-
-    size_t reply_len = len > available ? available : len;
-    memcpy(c->buf+c->bufpos,s,reply_len);
-    c->bufpos+=reply_len;
-    /* We update the buffer peak after appending the reply to the buffer */
-    if(c->buf_peak < (size_t)c->bufpos)
-        c->buf_peak = (size_t)c->bufpos;
-    return reply_len;
-}
-
 /* Adds the reply to the reply linked list.
  * Note: some edits to this function need to be relayed to AddReplyFromClient. */
 void _addReplyProtoToList(client *c, list *reply_list, const char *s, size_t len) {
@@ -419,7 +396,20 @@ void _addReplyToBufferOrList(client *c, const char *s, size_t len) {
         return;
     }
 
-    size_t reply_len = _addReplyToBuffer(c,s,len);
+    /* We update the buffer peak always */
+    const size_t available = c->buf_usable_size - c->bufpos;
+
+    size_t reply_len = 0;
+    /* If there already are entries in the reply list, we cannot
+     * add anything more to the static buffer. */
+    if (listLength(c->reply) < 1) {
+        reply_len = len > available ? available : len;
+        memcpy(c->buf+c->bufpos,s,reply_len);
+        c->bufpos+=reply_len;
+        /* We update the buffer peak after appending the reply to the buffer */
+        c->buf_peak = max(c->buf_peak,(size_t)c->bufpos);
+    }
+
     if (len > reply_len) _addReplyProtoToList(c,c->reply,s+reply_len,len-reply_len);
 }
 
@@ -1078,9 +1068,26 @@ void addReplyBulkLen(client *c, robj *obj) {
 
 /* Add a Redis Object as a bulk reply */
 void addReplyBulk(client *c, robj *obj) {
-    addReplyBulkLen(c,obj);
-    addReply(c,obj);
-    addReplyProto(c,"\r\n",2);
+    if (prepareClientToWrite(c) != C_OK) return;
+
+    if (sdsEncodedObject(obj)) {
+        const size_t len = sdslen(obj->ptr);
+        _addReplyLongLongBulk(c, len);
+        _addReplyToBufferOrList(c,obj->ptr,len);
+        _addReplyToBufferOrList(c,"\r\n",2);
+    } else if (obj->encoding == OBJ_ENCODING_INT) {
+        /* For integer encoded strings we just convert it into a string
+         * using our optimized function, and attach the resulting string
+         * to the output buffer. */
+        char buf[34];
+        size_t len = ll2string(buf,sizeof(buf),(long)obj->ptr);
+        buf[len+1] = '\r';
+        buf[len+2] = '\n';
+        _addReplyLongLongBulk(c, len);
+        _addReplyToBufferOrList(c,buf,len+2);
+    } else {
+        serverPanic("Wrong obj->encoding in addReply()");
+    }
 }
 
 /* Add a C buffer as bulk reply */
@@ -1441,16 +1448,22 @@ void freeClientOriginalArgv(client *c) {
     c->original_argc = 0;
 }
 
-void freeClientArgv(client *c) {
+static inline void freeClientArgvInternal(client *c, int free_argv) {
     int j;
     for (j = 0; j < c->argc; j++)
         decrRefCount(c->argv[j]);
     c->argc = 0;
     c->cmd = NULL;
     c->argv_len_sum = 0;
-    c->argv_len = 0;
-    zfree(c->argv);
-    c->argv = NULL;
+    if (free_argv) {
+        c->argv_len = 0;
+        zfree(c->argv);
+        c->argv = NULL;
+    }
+}
+
+void freeClientArgv(client *c) {
+    freeClientArgvInternal(c, 1);
 }
 
 /* Close all the slaves connections. This is useful in chained replication
@@ -2152,11 +2165,10 @@ int handleClientsWithPendingWrites(void) {
     return processed;
 }
 
-/* resetClient prepare the client to process the next command */
-void resetClient(client *c) {
+static inline void resetClientInternal(client *c, int free_argv) {
     redisCommandProc *prevcmd = c->cmd ? c->cmd->proc : NULL;
 
-    freeClientArgv(c);
+    freeClientArgvInternal(c, free_argv);
     c->cur_script = NULL;
     c->reqtype = 0;
     c->multibulklen = 0;
@@ -2193,6 +2205,11 @@ void resetClient(client *c) {
         c->flags |= CLIENT_REPLY_SKIP;
         c->flags &= ~CLIENT_REPLY_SKIP_NEXT;
     }
+}
+
+/* resetClient prepare the client to process the next command */
+void resetClient(client *c) {
+    resetClientInternal(c, 1);
 }
 
 /* This function is used when we want to re-enter the event loop but there
@@ -2292,9 +2309,12 @@ int processInlineBuffer(client *c) {
 
     /* Setup argv array on client structure */
     if (argc) {
-        if (c->argv) zfree(c->argv);
-        c->argv_len = argc;
-        c->argv = zmalloc(sizeof(robj*)*c->argv_len);
+        /* Create new argv if space is insufficient. */
+        if (unlikely(argc > c->argv_len)) {
+            zfree(c->argv);
+            c->argv = zmalloc(sizeof(robj*)*argc);
+            c->argv_len = argc;
+        }
         c->argv_len_sum = 0;
     }
 
@@ -2395,10 +2415,13 @@ int processMultibulkBuffer(client *c) {
 
         c->multibulklen = ll;
 
-        /* Setup argv array on client structure */
-        if (c->argv) zfree(c->argv);
-        c->argv_len = min(c->multibulklen, 1024);
-        c->argv = zmalloc(sizeof(robj*)*c->argv_len);
+        /* Setup argv array on client structure.
+         * Create new argv if space is insufficient or if we need to allocate it gradually. */
+        if (unlikely(c->multibulklen > c->argv_len || c->multibulklen > 1024)) {
+            zfree(c->argv);
+            c->argv_len = min(c->multibulklen, 1024);
+            c->argv = zmalloc(sizeof(robj*)*c->argv_len);
+        }
         c->argv_len_sum = 0;
     }
 
@@ -2530,7 +2553,7 @@ void commandProcessed(client *c) {
     if (c->flags & CLIENT_BLOCKED) return;
 
     reqresAppendResponse(c);
-    resetClient(c);
+    resetClientInternal(c, 0);
 
     long long prev_offset = c->reploff;
     if (c->flags & CLIENT_MASTER && !(c->flags & CLIENT_MULTI)) {
@@ -2661,7 +2684,7 @@ int processInputBuffer(client *c) {
 
         /* Multibulk processing could see a <= 0 length. */
         if (c->argc == 0) {
-            resetClient(c);
+            resetClientInternal(c, 0);
         } else {
             /* If we are in the context of an I/O thread, we can't really
              * execute the command here. All we can do is to flag the client

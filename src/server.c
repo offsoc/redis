@@ -784,6 +784,19 @@ int clientsCronResizeQueryBuffer(client *c) {
     return 0;
 }
 
+/* If the client has been idle for too long, free the client's arguments. */
+int clientsCronFreeArgvIfIdle(client *c) {
+    /* If the arguments have already been freed or are still in use, exit ASAP. */
+    if (!c->argv || c->argc) return 0;
+    time_t idletime = server.unixtime - c->lastinteraction;
+    if (idletime > 2) {
+        c->argv_len = 0;
+        zfree(c->argv);
+        c->argv = NULL;
+    }
+    return 0;
+}
+
 /* The client output buffer can be adjusted to better fit the memory requirements.
  *
  * the logic is:
@@ -1050,6 +1063,7 @@ void clientsCron(void) {
          * terminated. */
         if (clientsCronHandleTimeout(c,now)) continue;
         if (clientsCronResizeQueryBuffer(c)) continue;
+        if (clientsCronFreeArgvIfIdle(c)) continue;
         if (clientsCronResizeOutputBuffer(c,now)) continue;
 
         if (clientsCronTrackExpansiveClients(c, curr_peak_mem_usage_slot)) continue;
@@ -5686,8 +5700,8 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
         size_t zmalloc_used = zmalloc_used_memory();
         size_t total_system_mem = server.system_memory_size;
         const char *evict_policy = evictPolicyToString();
-        long long memory_lua = evalMemory();
-        long long memory_functions = functionsMemory();
+        long long memory_lua = evalScriptsMemoryVM();
+        long long memory_functions = functionsMemoryVM();
         struct redisMemOverhead *mh = getMemoryOverheadData();
 
         /* Peak memory is updated from time to time by serverCron() so it
@@ -5702,7 +5716,7 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
         bytesToHuman(total_system_hmem,sizeof(total_system_hmem),total_system_mem);
         bytesToHuman(used_memory_lua_hmem,sizeof(used_memory_lua_hmem),memory_lua);
         bytesToHuman(used_memory_vm_total_hmem,sizeof(used_memory_vm_total_hmem),memory_functions + memory_lua);
-        bytesToHuman(used_memory_scripts_hmem,sizeof(used_memory_scripts_hmem),mh->lua_caches + mh->functions_caches);
+        bytesToHuman(used_memory_scripts_hmem,sizeof(used_memory_scripts_hmem),mh->eval_caches + mh->functions_caches);
         bytesToHuman(used_memory_rss_hmem,sizeof(used_memory_rss_hmem),server.cron_malloc_stats.process_rss);
         bytesToHuman(maxmemory_hmem,sizeof(maxmemory_hmem),server.maxmemory);
 
@@ -5728,7 +5742,7 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "used_memory_lua:%lld\r\n", memory_lua, /* deprecated, renamed to used_memory_vm_eval */
             "used_memory_vm_eval:%lld\r\n", memory_lua,
             "used_memory_lua_human:%s\r\n", used_memory_lua_hmem, /* deprecated */
-            "used_memory_scripts_eval:%lld\r\n", (long long)mh->lua_caches,
+            "used_memory_scripts_eval:%lld\r\n", (long long)mh->eval_caches,
             "number_of_cached_scripts:%lu\r\n", dictSize(evalScriptsDict()),
             "number_of_functions:%lu\r\n", functionsNum(),
             "number_of_libraries:%lu\r\n", functionsLibNum(),
@@ -5736,7 +5750,7 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "used_memory_vm_total:%lld\r\n", memory_functions + memory_lua,
             "used_memory_vm_total_human:%s\r\n", used_memory_vm_total_hmem,
             "used_memory_functions:%lld\r\n", (long long)mh->functions_caches,
-            "used_memory_scripts:%lld\r\n", (long long)mh->lua_caches + (long long)mh->functions_caches,
+            "used_memory_scripts:%lld\r\n", (long long)mh->eval_caches + (long long)mh->functions_caches,
             "used_memory_scripts_human:%s\r\n", used_memory_scripts_hmem,
             "maxmemory:%lld\r\n", server.maxmemory,
             "maxmemory_human:%s\r\n", maxmemory_hmem,
